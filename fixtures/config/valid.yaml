@@ -1,0 +1,8 @@
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+  max_turns: 12
+events:
+  format: jsonl
