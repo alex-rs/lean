@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -31,6 +34,8 @@ pub struct RuntimeConfig {
 pub struct EventConfig {
     #[serde(default = "default_event_format")]
     pub format: EventFormat,
+    #[serde(default)]
+    pub audit_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -132,6 +137,29 @@ mod tests {
         assert_eq!(config.runtime.default_provider, "mock");
         assert_eq!(config.runtime.max_turns, 12);
         assert_eq!(config.events.format, EventFormat::Jsonl);
+        assert_eq!(config.events.audit_path, None);
+    }
+
+    #[test]
+    fn parses_optional_audit_path() {
+        let config = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+  audit_path: target/lean-audit.jsonl
+"#,
+        )
+        .expect("config with audit path should parse");
+
+        assert_eq!(
+            config.events.audit_path,
+            Some(PathBuf::from("target/lean-audit.jsonl"))
+        );
     }
 
     #[test]
