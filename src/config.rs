@@ -12,6 +12,8 @@ pub struct LeanConfig {
     pub project: ProjectConfig,
     pub runtime: RuntimeConfig,
     pub events: EventConfig,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -36,6 +38,13 @@ pub struct EventConfig {
     pub format: EventFormat,
     #[serde(default)]
     pub audit_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub worktree_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -110,6 +119,17 @@ impl LeanConfig {
             ));
         }
 
+        if self
+            .workspace
+            .worktree_root
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "workspace.worktree_root must not be empty".to_string(),
+            ));
+        }
+
         Ok(self)
     }
 }
@@ -138,6 +158,7 @@ mod tests {
         assert_eq!(config.runtime.max_turns, 12);
         assert_eq!(config.events.format, EventFormat::Jsonl);
         assert_eq!(config.events.audit_path, None);
+        assert_eq!(config.workspace.worktree_root, None);
     }
 
     #[test]
@@ -192,6 +213,52 @@ extra: value
         assert!(
             matches!(error, ConfigError::Parse { .. }),
             "unknown field should be a parse error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn parses_optional_worktree_root() {
+        let config = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+workspace:
+  worktree_root: ../.lean-worktrees
+"#,
+        )
+        .expect("config with workspace root should parse");
+
+        assert_eq!(
+            config.workspace.worktree_root,
+            Some(PathBuf::from("../.lean-worktrees"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_worktree_root() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+workspace:
+  worktree_root: ""
+"#,
+        )
+        .expect_err("empty workspace root should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "empty workspace root should fail validation, got {error:?}"
         );
     }
 
