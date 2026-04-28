@@ -6,3 +6,4 @@ pub mod doctor;
 pub mod events;
 pub mod provider;
 pub mod session;
+pub mod workspace;
