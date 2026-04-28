@@ -1,5 +1,8 @@
+pub mod audit;
+pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod events;
 pub mod provider;
 pub mod session;
