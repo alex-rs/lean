@@ -13,6 +13,8 @@ pub struct LeanConfig {
     pub runtime: RuntimeConfig,
     pub events: EventConfig,
     #[serde(default)]
+    pub commands: CommandConfig,
+    #[serde(default)]
     pub workspace: WorkspaceConfig,
 }
 
@@ -45,6 +47,24 @@ pub struct EventConfig {
 pub struct WorkspaceConfig {
     #[serde(default)]
     pub worktree_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandConfig {
+    #[serde(default)]
+    pub allowed: Vec<Vec<String>>,
+    #[serde(default = "default_env_allowlist")]
+    pub env_allowlist: Vec<String>,
+}
+
+impl Default for CommandConfig {
+    fn default() -> Self {
+        Self {
+            allowed: Vec::new(),
+            env_allowlist: default_env_allowlist(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -130,6 +150,31 @@ impl LeanConfig {
             ));
         }
 
+        for prefix in &self.commands.allowed {
+            if prefix.is_empty() {
+                return Err(ConfigError::Validation(
+                    "commands.allowed entries must not be empty".to_string(),
+                ));
+            }
+
+            if prefix.iter().any(|part| part.trim().is_empty()) {
+                return Err(ConfigError::Validation(
+                    "commands.allowed entries must not contain empty argv parts".to_string(),
+                ));
+            }
+        }
+
+        if self
+            .commands
+            .env_allowlist
+            .iter()
+            .any(|name| name.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "commands.env_allowlist entries must not be empty".to_string(),
+            ));
+        }
+
         Ok(self)
     }
 }
@@ -140,6 +185,10 @@ fn default_max_turns() -> u32 {
 
 fn default_event_format() -> EventFormat {
     EventFormat::Jsonl
+}
+
+fn default_env_allowlist() -> Vec<String> {
+    vec!["PATH".to_string()]
 }
 
 #[cfg(test)]
@@ -158,6 +207,8 @@ mod tests {
         assert_eq!(config.runtime.max_turns, 12);
         assert_eq!(config.events.format, EventFormat::Jsonl);
         assert_eq!(config.events.audit_path, None);
+        assert_eq!(config.commands.allowed, Vec::<Vec<String>>::new());
+        assert_eq!(config.commands.env_allowlist, vec!["PATH".to_string()]);
         assert_eq!(config.workspace.worktree_root, None);
     }
 
@@ -259,6 +310,89 @@ workspace:
         assert!(
             matches!(error, ConfigError::Validation(_)),
             "empty workspace root should fail validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn parses_command_policy_config() {
+        let config = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+commands:
+  allowed:
+    - ["cargo", "test"]
+    - ["git", "status"]
+  env_allowlist:
+    - PATH
+    - RUST_LOG
+"#,
+        )
+        .expect("config with command policy should parse");
+
+        assert_eq!(
+            config.commands.allowed,
+            vec![
+                vec!["cargo".to_string(), "test".to_string()],
+                vec!["git".to_string(), "status".to_string()],
+            ]
+        );
+        assert_eq!(
+            config.commands.env_allowlist,
+            vec!["PATH".to_string(), "RUST_LOG".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_command_prefixes() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+commands:
+  allowed:
+    - []
+"#,
+        )
+        .expect_err("empty command prefixes should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "empty command prefix should fail validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_env_allowlist_entries() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: mock
+events:
+  format: jsonl
+commands:
+  env_allowlist:
+    - ""
+"#,
+        )
+        .expect_err("empty env allowlist entries should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "empty env allowlist entry should fail validation, got {error:?}"
         );
     }
 
