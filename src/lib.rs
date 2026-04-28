@@ -5,5 +5,6 @@ pub mod config;
 pub mod doctor;
 pub mod events;
 pub mod provider;
+pub mod sandbox;
 pub mod session;
 pub mod workspace;
