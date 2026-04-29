@@ -8,6 +8,7 @@ use lean::{
     config::{ConfigError, LeanConfig},
     doctor::run_doctor,
     events::{CredentialAccessed, JsonlEvent},
+    prompts::PromptStore,
     provider::{CredentialAccess, ProviderRegistry},
     session::{SessionRun, SessionRunner},
 };
@@ -32,6 +33,12 @@ fn run_command(cli: &Cli, args: &RunArgs) -> ExitCode {
         Err(message) => return exit_with_error(message),
     };
     let provider_name = resolve_provider_name(args, config.as_ref());
+    let prompt_bundle = match PromptStore::from_current_user()
+        .and_then(|store| store.load_or_create(&args.prompt))
+    {
+        Ok(bundle) => bundle,
+        Err(error) => return exit_with_error(error.to_string()),
+    };
     let resolved_provider =
         match ProviderRegistry::from_config(config.as_ref()).resolve_with_audit(&provider_name) {
             Ok(provider) => provider,
@@ -47,6 +54,7 @@ fn run_command(cli: &Cli, args: &RunArgs) -> ExitCode {
     let mut runner = SessionRunner::new(resolved_provider.into_provider());
     let events = runner.run(SessionRun {
         task: args.task.clone(),
+        system_prompt: Some(prompt_bundle.render_system_prompt()),
     });
 
     if let Some(audit_path) = config
