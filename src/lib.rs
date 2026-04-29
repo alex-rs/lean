@@ -9,4 +9,5 @@ pub mod provider;
 pub mod read_tools;
 pub mod sandbox;
 pub mod session;
+pub mod tool_use;
 pub mod workspace;
