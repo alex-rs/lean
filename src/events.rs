@@ -4,6 +4,7 @@ pub const SESSION_STARTED: &str = "session.started";
 pub const HEARTBEAT: &str = "heartbeat";
 pub const SESSION_RESULT: &str = "session.result";
 pub const SESSION_ERROR: &str = "session.error";
+pub const CREDENTIAL_ACCESSED: &str = "credential.accessed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "payload")]
@@ -16,6 +17,8 @@ pub enum JsonlEvent {
     SessionResult(SessionResult),
     #[serde(rename = "session.error")]
     SessionError(SessionError),
+    #[serde(rename = "credential.accessed")]
+    CredentialAccessed(CredentialAccessed),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +48,12 @@ pub struct SessionError {
     pub recoverable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialAccessed {
+    pub provider: String,
+    pub env_var: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -59,6 +68,7 @@ impl JsonlEvent {
             Self::Heartbeat(_) => HEARTBEAT,
             Self::SessionResult(_) => SESSION_RESULT,
             Self::SessionError(_) => SESSION_ERROR,
+            Self::CredentialAccessed(_) => CREDENTIAL_ACCESSED,
         }
     }
 
@@ -74,8 +84,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        HEARTBEAT, Heartbeat, JsonlEvent, SESSION_ERROR, SESSION_RESULT, SESSION_STARTED,
-        SessionError, SessionResult, SessionStarted, SessionStatus,
+        CREDENTIAL_ACCESSED, CredentialAccessed, HEARTBEAT, Heartbeat, JsonlEvent, SESSION_ERROR,
+        SESSION_RESULT, SESSION_STARTED, SessionError, SessionResult, SessionStarted,
+        SessionStatus,
     };
 
     #[test]
@@ -111,6 +122,13 @@ mod tests {
                     recoverable: false,
                 }),
                 SESSION_ERROR,
+            ),
+            (
+                JsonlEvent::CredentialAccessed(CredentialAccessed {
+                    provider: "minimax".to_string(),
+                    env_var: "MINIMAX_API_KEY".to_string(),
+                }),
+                CREDENTIAL_ACCESSED,
             ),
         ];
 
