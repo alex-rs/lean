@@ -200,6 +200,88 @@ fn run_with_builtin_minimax_provider_emits_jsonl_and_audits_credential() {
 }
 
 #[test]
+fn run_with_rig_provider_emits_existing_jsonl_contract() {
+    let server = FakeHttpServer::spawn(
+        200,
+        r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"fake-model","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"rig provider completed"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"total_tokens":2}}"#,
+    );
+    let temp_dir = unique_temp_dir("rig-provider-contract");
+    let config_path = temp_dir.join("lean.yaml");
+    let audit_path = temp_dir.join("audit").join("session.jsonl");
+    write_rig_provider_config(&config_path, server.base_url(), &audit_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("LEAN_TEST_RIG_PROVIDER_KEY", "test-token")
+        .args([
+            "--config",
+            config_path.to_str().expect("config path should be UTF-8"),
+            "run",
+            "--provider",
+            "rig-openai",
+            "--json",
+            "--task",
+            "call rig provider",
+        ])
+        .output()
+        .expect("lean run should execute");
+
+    assert!(
+        output.status.success(),
+        "lean run should exit zero, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let events = parse_jsonl_events(&stdout);
+
+    assert_eq!(
+        events.first().expect("run should emit a started event"),
+        &JsonlEvent::SessionStarted(lean::events::SessionStarted {
+            session_id: "session-0001".to_string(),
+            task: "call rig provider".to_string(),
+            provider: "rig-openai".to_string(),
+        })
+    );
+    assert_eq!(
+        events.last().expect("run should emit a final event"),
+        &JsonlEvent::SessionResult(lean::events::SessionResult {
+            session_id: "session-0001".to_string(),
+            status: SessionStatus::Success,
+            message: "rig provider completed".to_string(),
+        })
+    );
+
+    let request = server.request();
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-token")
+    );
+    let body = http_body(&request);
+    let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
+    assert_eq!(value["model"], "fake-model");
+    assert_eq!(value["messages"][0]["content"], "call rig provider");
+
+    let audit_contents = fs::read_to_string(audit_path).expect("audit log should be readable");
+    let audit_events = parse_jsonl_events(&audit_contents);
+    assert_eq!(
+        audit_events
+            .first()
+            .expect("audit should include credential row"),
+        &JsonlEvent::CredentialAccessed(lean::events::CredentialAccessed {
+            provider: "rig-openai".to_string(),
+            env_var: "LEAN_TEST_RIG_PROVIDER_KEY".to_string(),
+        })
+    );
+    assert_eq!(
+        audit_events
+            .last()
+            .expect("audit should include final event"),
+        events.last().expect("stdout should include final event")
+    );
+}
+
+#[test]
 fn run_with_configured_audit_path_records_complete_jsonl_session() {
     let temp_dir = unique_temp_dir("audit-contract");
     let config_path = temp_dir.join("lean.yaml");
@@ -381,6 +463,30 @@ events:
         audit_path.display()
     );
     fs::write(config_path, contents).expect("test built-in provider config should be writable");
+}
+
+fn write_rig_provider_config(config_path: &Path, base_url: &str, audit_path: &Path) {
+    let contents = format!(
+        r#"project:
+  name: lean
+  root: .
+runtime:
+  default_provider: rig-openai
+  max_turns: 12
+events:
+  format: jsonl
+  audit_path: {}
+providers:
+  - name: rig-openai
+    type: rig
+    family: openai
+    model: fake-model
+    api_key_env: LEAN_TEST_RIG_PROVIDER_KEY
+    base_url: {base_url}
+"#,
+        audit_path.display()
+    );
+    fs::write(config_path, contents).expect("test rig provider config should be writable");
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
