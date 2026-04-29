@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod doctor;
 pub mod events;
+pub mod prompts;
 pub mod provider;
 pub mod read_tools;
 pub mod sandbox;

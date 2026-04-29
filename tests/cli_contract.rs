@@ -9,7 +9,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use lean::events::{JsonlEvent, SESSION_RESULT, SessionStatus};
+use lean::{
+    events::{JsonlEvent, SESSION_RESULT, SessionStatus},
+    prompts::default_prompt_bundle,
+};
 use serde_json::Value;
 
 #[test]
@@ -32,7 +35,9 @@ fn binary_help_lists_expected_subcommands() {
 
 #[test]
 fn run_with_mock_provider_emits_parseable_jsonl_result() {
+    let home = unique_temp_dir("mock-provider-home");
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
         .args(["run", "--provider", "mock", "--json", "--task", "noop"])
         .output()
         .expect("lean run should execute");
@@ -60,11 +65,13 @@ fn run_with_configured_real_provider_emits_existing_jsonl_contract() {
         r#"{"choices":[{"message":{"content":"fake real provider completed"}}]}"#,
     );
     let temp_dir = unique_temp_dir("real-provider-contract");
+    let home = unique_temp_dir("real-provider-home");
     let config_path = temp_dir.join("lean.yaml");
     let audit_path = temp_dir.join("audit").join("session.jsonl");
     write_real_provider_config(&config_path, server.base_url(), &audit_path);
 
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
         .env("LEAN_TEST_REAL_PROVIDER_KEY", "test-token")
         .args([
             "--config",
@@ -114,7 +121,16 @@ fn run_with_configured_real_provider_emits_existing_jsonl_contract() {
     let body = http_body(&request);
     let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
     assert_eq!(value["model"], "fake-model");
-    assert_eq!(value["messages"][0]["content"], "call a fake provider");
+    assert_eq!(value["messages"][0]["role"], "system");
+    assert!(message_content_text(&value["messages"][0]).contains("Available Tools"));
+    assert_eq!(value["messages"][1]["role"], "user");
+    assert_eq!(value["messages"][1]["content"], "call a fake provider");
+    assert!(
+        home.join(".lean")
+            .join("prompts")
+            .join("default.json")
+            .is_file()
+    );
 
     let audit_contents = fs::read_to_string(audit_path).expect("audit log should be readable");
     let audit_events = parse_jsonl_events(&audit_contents);
@@ -142,11 +158,13 @@ fn run_with_builtin_minimax_provider_emits_jsonl_and_audits_credential() {
         r#"{"choices":[{"message":{"content":"builtin minimax completed"}}]}"#,
     );
     let temp_dir = unique_temp_dir("builtin-minimax-contract");
+    let home = unique_temp_dir("builtin-minimax-home");
     let config_path = temp_dir.join("lean.yaml");
     let audit_path = temp_dir.join("audit").join("session.jsonl");
     write_builtin_provider_config(&config_path, &audit_path);
 
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
         .env("MINIMAX_API_KEY", "test-token")
         .env("MINIMAX_BASE_URL", server.base_url())
         .args([
@@ -183,7 +201,9 @@ fn run_with_builtin_minimax_provider_emits_jsonl_and_audits_credential() {
     let body = http_body(&request);
     let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
     assert_eq!(value["model"], "MiniMax-M2.7");
-    assert_eq!(value["messages"][0]["content"], "call builtin minimax");
+    assert_eq!(value["messages"][0]["role"], "system");
+    assert_eq!(value["messages"][1]["role"], "user");
+    assert_eq!(value["messages"][1]["content"], "call builtin minimax");
     assert_eq!(value["reasoning_split"], Value::Bool(true));
 
     let audit_contents = fs::read_to_string(audit_path).expect("audit log should be readable");
@@ -206,11 +226,13 @@ fn run_with_rig_provider_emits_existing_jsonl_contract() {
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"fake-model","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"rig provider completed"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"total_tokens":2}}"#,
     );
     let temp_dir = unique_temp_dir("rig-provider-contract");
+    let home = unique_temp_dir("rig-provider-home");
     let config_path = temp_dir.join("lean.yaml");
     let audit_path = temp_dir.join("audit").join("session.jsonl");
     write_rig_provider_config(&config_path, server.base_url(), &audit_path);
 
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
         .env("LEAN_TEST_RIG_PROVIDER_KEY", "test-token")
         .args([
             "--config",
@@ -260,7 +282,13 @@ fn run_with_rig_provider_emits_existing_jsonl_contract() {
     let body = http_body(&request);
     let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
     assert_eq!(value["model"], "fake-model");
-    assert_eq!(value["messages"][0]["content"], "call rig provider");
+    assert_eq!(value["messages"][0]["role"], "system");
+    assert!(message_content_text(&value["messages"][0]).contains("read_file"));
+    assert_eq!(value["messages"][1]["role"], "user");
+    assert_eq!(
+        message_content_text(&value["messages"][1]),
+        "call rig provider"
+    );
 
     let audit_contents = fs::read_to_string(audit_path).expect("audit log should be readable");
     let audit_events = parse_jsonl_events(&audit_contents);
@@ -282,13 +310,70 @@ fn run_with_rig_provider_emits_existing_jsonl_contract() {
 }
 
 #[test]
+fn run_loads_custom_prompt_bundle_from_home_prompt_directory() {
+    let server = FakeHttpServer::spawn(
+        200,
+        r#"{"choices":[{"message":{"content":"custom prompt completed"}}]}"#,
+    );
+    let temp_dir = unique_temp_dir("custom-prompt-contract");
+    let home = unique_temp_dir("custom-prompt-home");
+    let prompt_dir = home.join(".lean").join("prompts");
+    fs::create_dir_all(&prompt_dir).expect("prompt dir should be writable");
+    let mut prompt = default_prompt_bundle();
+    prompt.id = "custom".to_string();
+    prompt.title = "Custom Prompt".to_string();
+    prompt.system = vec!["Use this custom home prompt.".to_string()];
+    fs::write(
+        prompt_dir.join("custom.json"),
+        serde_json::to_string_pretty(&prompt).expect("prompt should serialize"),
+    )
+    .expect("custom prompt should be writable");
+
+    let config_path = temp_dir.join("lean.yaml");
+    let audit_path = temp_dir.join("audit").join("session.jsonl");
+    write_real_provider_config(&config_path, server.base_url(), &audit_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
+        .env("LEAN_TEST_REAL_PROVIDER_KEY", "test-token")
+        .args([
+            "--config",
+            config_path.to_str().expect("config path should be UTF-8"),
+            "run",
+            "--provider",
+            "fake-real",
+            "--prompt",
+            "custom",
+            "--json",
+            "--task",
+            "use custom prompt",
+        ])
+        .output()
+        .expect("lean run should execute");
+
+    assert!(
+        output.status.success(),
+        "lean run should exit zero, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let request = server.request();
+    let body = http_body(&request);
+    let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
+    assert!(message_content_text(&value["messages"][0]).contains("Use this custom home prompt."));
+    assert_eq!(value["messages"][1]["content"], "use custom prompt");
+}
+
+#[test]
 fn run_with_configured_audit_path_records_complete_jsonl_session() {
     let temp_dir = unique_temp_dir("audit-contract");
+    let home = unique_temp_dir("audit-home");
     let config_path = temp_dir.join("lean.yaml");
     let audit_path = temp_dir.join("audit").join("session.jsonl");
     write_config(&config_path, &audit_path);
 
     let output = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .env("HOME", &home)
         .args([
             "--config",
             config_path.to_str().expect("config path should be UTF-8"),
@@ -406,6 +491,13 @@ fn parse_jsonl_events(contents: &str) -> Vec<JsonlEvent> {
 fn parse_stdout_json(stdout: Vec<u8>) -> Value {
     let stdout = String::from_utf8(stdout).expect("stdout should be UTF-8");
     serde_json::from_str(&stdout).expect("stdout should parse as JSON")
+}
+
+fn message_content_text(message: &Value) -> &str {
+    message["content"]
+        .as_str()
+        .or_else(|| message["content"][0]["text"].as_str())
+        .expect("message should contain text")
 }
 
 fn write_config(config_path: &Path, audit_path: &Path) {

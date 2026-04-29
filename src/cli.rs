@@ -48,6 +48,14 @@ pub struct RunArgs {
 
     #[arg(long, value_name = "NAME", help = "Provider adapter to use")]
     pub provider: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        help = "Prompt bundle to load from ~/.lean/prompts/<NAME>.json"
+    )]
+    pub prompt: String,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -100,6 +108,7 @@ mod tests {
             Commands::Run(super::RunArgs {
                 task: "noop".to_string(),
                 provider: Some("mock".to_string()),
+                prompt: "default".to_string(),
             })
         );
     }

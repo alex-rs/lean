@@ -6,6 +6,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRun {
     pub task: String,
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -39,7 +40,10 @@ where
             sequence: 1,
         }));
 
-        match self.provider.complete(ModelRequest { task: run.task }) {
+        match self.provider.complete(ModelRequest {
+            task: run.task,
+            system_prompt: run.system_prompt,
+        }) {
             Ok(response) => events.push(JsonlEvent::SessionResult(SessionResult {
                 session_id,
                 status: SessionStatus::Success,
@@ -76,6 +80,7 @@ mod tests {
         let mut runner = SessionRunner::new(MockProvider::new("done"));
         let events = runner.run(SessionRun {
             task: "noop".to_string(),
+            system_prompt: Some("system instructions".to_string()),
         });
 
         let event_names = events.iter().map(JsonlEvent::name).collect::<Vec<_>>();

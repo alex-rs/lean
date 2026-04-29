@@ -22,6 +22,7 @@ pub const OPENAI_COMPATIBLE_BASE_URL: &str = "https://api.openai.com/v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub task: String,
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,7 +472,7 @@ impl RigProvider {
         }
     }
 
-    async fn complete_async(&self, task: String) -> Result<ModelResponse, ProviderError> {
+    async fn complete_async(&self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
         match self.family {
             RigProviderFamily::OpenAi => {
                 let mut builder =
@@ -483,14 +484,14 @@ impl RigProvider {
                 let client = builder.build().map_err(|_| {
                     ProviderError::new(self.name.clone(), ProviderErrorKind::HttpTransport)
                 })?;
-                self.complete_rig_model(client.completion_model(self.model.clone()), task)
+                self.complete_rig_model(client.completion_model(self.model.clone()), request)
                     .await
             }
             RigProviderFamily::Anthropic => {
                 let client = anthropic::Client::new(self.api_key.clone()).map_err(|_| {
                     ProviderError::new(self.name.clone(), ProviderErrorKind::HttpTransport)
                 })?;
-                self.complete_rig_model(client.completion_model(self.model.clone()), task)
+                self.complete_rig_model(client.completion_model(self.model.clone()), request)
                     .await
             }
         }
@@ -499,14 +500,22 @@ impl RigProvider {
     async fn complete_rig_model<M>(
         &self,
         model: M,
-        task: String,
+        request: ModelRequest,
     ) -> Result<ModelResponse, ProviderError>
     where
         M: CompletionModel,
     {
-        let response = model
-            .completion_request(task)
-            .max_tokens_opt(self.max_tokens)
+        let mut builder = model
+            .completion_request(request.task)
+            .max_tokens_opt(self.max_tokens);
+        if let Some(system_prompt) = request
+            .system_prompt
+            .filter(|system_prompt| !system_prompt.trim().is_empty())
+        {
+            builder = builder.preamble(system_prompt);
+        }
+
+        let response = builder
             .send()
             .await
             .map_err(|error| self.map_rig_error(error))?;
@@ -562,7 +571,7 @@ impl ModelProvider for RigProvider {
     }
 
     fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
-        self.runtime.block_on(self.complete_async(request.task))
+        self.runtime.block_on(self.complete_async(request))
     }
 }
 
@@ -659,12 +668,25 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = request
+            .system_prompt
+            .as_deref()
+            .filter(|system_prompt| !system_prompt.trim().is_empty())
+        {
+            messages.push(ChatCompletionMessage {
+                role: "system",
+                content: system_prompt,
+            });
+        }
+        messages.push(ChatCompletionMessage {
+            role: "user",
+            content: &request.task,
+        });
+
         let body = ChatCompletionRequest {
             model: &self.model,
-            messages: vec![ChatCompletionMessage {
-                role: "user",
-                content: &request.task,
-            }],
+            messages,
             stream: false,
             reasoning_split: self.reasoning_split,
         };
@@ -768,6 +790,7 @@ mod tests {
         let response = provider
             .complete(ModelRequest {
                 task: "noop".to_string(),
+                system_prompt: None,
             })
             .expect("mock provider should not fail");
 
@@ -979,6 +1002,7 @@ mod tests {
         let response = provider
             .complete(ModelRequest {
                 task: "summarize this".to_string(),
+                system_prompt: Some("Use the system prompt.".to_string()),
             })
             .expect("fake provider should complete");
 
@@ -991,9 +1015,41 @@ mod tests {
         let body = http_body(&request);
         let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
         assert_eq!(value["model"], "fake-model");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "Use the system prompt.");
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(value["messages"][1]["content"], "summarize this");
+        assert_eq!(value["stream"], Value::Bool(false));
+    }
+
+    #[test]
+    fn openai_compatible_provider_omits_blank_system_prompt() {
+        let server = FakeHttpServer::spawn(
+            200,
+            r#"{"choices":[{"message":{"content":"real provider completed"}}]}"#,
+        );
+        let provider =
+            OpenAiCompatibleProvider::new("fake", "fake-model", server.base_url(), "test-token");
+
+        provider
+            .complete(ModelRequest {
+                task: "summarize this".to_string(),
+                system_prompt: Some("  ".to_string()),
+            })
+            .expect("fake provider should complete");
+
+        let request = server.request();
+        let body = http_body(&request);
+        let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][0]["content"], "summarize this");
-        assert_eq!(value["stream"], Value::Bool(false));
+        assert_eq!(
+            value["messages"]
+                .as_array()
+                .expect("messages should be an array")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1005,6 +1061,7 @@ mod tests {
         let error = provider
             .complete(ModelRequest {
                 task: "secret request body".to_string(),
+                system_prompt: None,
             })
             .expect_err("HTTP status should fail");
 
@@ -1027,6 +1084,7 @@ mod tests {
         let error = provider
             .complete(ModelRequest {
                 task: "noop".to_string(),
+                system_prompt: None,
             })
             .expect_err("missing content should fail");
 
@@ -1056,6 +1114,7 @@ mod tests {
         let response = provider
             .complete(ModelRequest {
                 task: "use rig".to_string(),
+                system_prompt: Some("Use rig system prompt.".to_string()),
             })
             .expect("rig provider should complete");
 
@@ -1068,8 +1127,49 @@ mod tests {
         let body = http_body(&request);
         let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
         assert_eq!(value["model"], "fake-model");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(
+            message_text(&value["messages"][0]),
+            "Use rig system prompt."
+        );
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(message_text(&value["messages"][1]), "use rig");
+    }
+
+    #[test]
+    fn rig_provider_omits_blank_system_prompt() {
+        let server = FakeHttpServer::spawn(
+            200,
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"fake-model","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"rig provider completed"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"total_tokens":2}}"#,
+        );
+        let provider = RigProvider::new(
+            "rig-openai",
+            RigProviderFamily::OpenAi,
+            "fake-model",
+            "test-token",
+            Some(server.base_url().to_string()),
+            None,
+        );
+
+        provider
+            .complete(ModelRequest {
+                task: "use rig".to_string(),
+                system_prompt: Some("  ".to_string()),
+            })
+            .expect("rig provider should complete");
+
+        let request = server.request();
+        let body = http_body(&request);
+        let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
         assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["messages"][0]["content"], "use rig");
+        assert_eq!(message_text(&value["messages"][0]), "use rig");
+        assert_eq!(
+            value["messages"]
+                .as_array()
+                .expect("messages should be an array")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1087,6 +1187,7 @@ mod tests {
         let error = provider
             .complete(ModelRequest {
                 task: "secret request body".to_string(),
+                system_prompt: None,
             })
             .expect_err("provider error should fail");
 
@@ -1252,5 +1353,12 @@ mod tests {
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
             .expect("request should include body")
+    }
+
+    fn message_text(message: &Value) -> &str {
+        message["content"]
+            .as_str()
+            .or_else(|| message["content"][0]["text"].as_str())
+            .expect("message should contain text")
     }
 }
