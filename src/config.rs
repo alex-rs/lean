@@ -51,10 +51,14 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ProviderKind,
+    #[serde(default)]
+    pub family: Option<String>,
     pub model: String,
     pub api_key_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -62,6 +66,7 @@ pub struct ProviderConfig {
 pub enum ProviderKind {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+    Rig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -235,6 +240,30 @@ fn validate_provider_config(
         ));
     }
 
+    match (provider.kind, provider.family.as_ref()) {
+        (ProviderKind::Rig, None) => {
+            return Err(ConfigError::Validation(
+                "providers.family is required when providers.type is rig".to_string(),
+            ));
+        }
+        (ProviderKind::OpenAiCompatible, Some(_)) => {
+            return Err(ConfigError::Validation(
+                "providers.family is only supported when providers.type is rig".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    if provider
+        .family
+        .as_ref()
+        .is_some_and(|family| family.trim().is_empty())
+    {
+        return Err(ConfigError::Validation(
+            "providers.family must not be empty".to_string(),
+        ));
+    }
+
     if !is_valid_env_name(&provider.api_key_env) {
         return Err(ConfigError::Validation(
             "providers.api_key_env must be a valid environment variable name".to_string(),
@@ -254,6 +283,15 @@ fn validate_provider_config(
                 "providers.base_url must start with http:// or https://".to_string(),
             ));
         }
+    }
+
+    if provider
+        .max_tokens
+        .is_some_and(|max_tokens| max_tokens == 0)
+    {
+        return Err(ConfigError::Validation(
+            "providers.max_tokens must be greater than zero".to_string(),
+        ));
     }
 
     Ok(())
@@ -285,7 +323,7 @@ fn default_env_allowlist() -> Vec<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{ConfigError, EventFormat, LeanConfig};
+    use super::{ConfigError, EventFormat, LeanConfig, ProviderKind};
 
     #[test]
     fn parses_valid_config_fixture() {
@@ -511,12 +549,48 @@ providers:
         assert_eq!(config.providers.len(), 1);
         let provider = &config.providers[0];
         assert_eq!(provider.name, "minimax");
+        assert_eq!(provider.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(provider.family, None);
         assert_eq!(provider.model, "MiniMax-M2.7");
         assert_eq!(provider.api_key_env, "MINIMAX_API_KEY");
         assert_eq!(
             provider.base_url,
             Some("https://api.minimax.io/v1".to_string())
         );
+        assert_eq!(provider.max_tokens, None);
+    }
+
+    #[test]
+    fn parses_rig_provider_config() {
+        let config = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: claude
+events:
+  format: jsonl
+providers:
+  - name: claude
+    type: rig
+    family: anthropic
+    model: claude-sonnet-4-5
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 2048
+"#,
+        )
+        .expect("config with rig provider should parse");
+
+        assert_eq!(config.providers.len(), 1);
+        let provider = &config.providers[0];
+        assert_eq!(provider.name, "claude");
+        assert_eq!(provider.kind, ProviderKind::Rig);
+        assert_eq!(provider.family, Some("anthropic".to_string()));
+        assert_eq!(provider.model, "claude-sonnet-4-5");
+        assert_eq!(provider.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(provider.base_url, None);
+        assert_eq!(provider.max_tokens, Some(2048));
     }
 
     #[test]
@@ -542,6 +616,59 @@ providers:
         assert!(
             matches!(error, ConfigError::Validation(_)),
             "invalid provider config should fail validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_rig_provider_without_family() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: no-family
+events:
+  format: jsonl
+providers:
+  - name: no-family
+    type: rig
+    model: gpt-4o
+    api_key_env: OPENAI_API_KEY
+"#,
+        )
+        .expect_err("rig provider without family should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "missing family should fail validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_provider_family_on_non_rig_provider() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: fake
+events:
+  format: jsonl
+providers:
+  - name: fake
+    type: openai-compatible
+    family: openai
+    model: fake-model
+    api_key_env: FAKE_API_KEY
+"#,
+        )
+        .expect_err("family on non-rig provider should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "unexpected family should fail validation, got {error:?}"
         );
     }
 

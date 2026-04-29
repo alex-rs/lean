@@ -1,5 +1,10 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
+use rig::{
+    client::CompletionClient,
+    completion::{AssistantContent, CompletionError, CompletionModel},
+    providers::{anthropic, openai},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -53,6 +58,12 @@ pub enum ProviderErrorKind {
     #[error("HTTP transport failed")]
     HttpTransport,
 
+    #[error("provider rejected the request")]
+    ProviderRejected,
+
+    #[error("provider request was invalid")]
+    InvalidRequest,
+
     #[error("provider returned malformed response: {reason}")]
     MalformedResponse { reason: &'static str },
 }
@@ -72,6 +83,16 @@ pub enum ProviderRegistryError {
     InvalidProviderSpec {
         provider: String,
         reason: &'static str,
+    },
+
+    #[error("unsupported Rig provider family {family} for provider {provider}")]
+    UnsupportedProviderFamily { provider: String, family: String },
+
+    #[error("provider {provider} option {option} is not supported for Rig family {family}")]
+    UnsupportedProviderOption {
+        provider: String,
+        family: String,
+        option: &'static str,
     },
 }
 
@@ -180,6 +201,50 @@ impl ProviderRegistry {
         &self,
         profile: ResolvedProviderProfile,
     ) -> Result<ResolvedProvider, ProviderRegistryError> {
+        match profile.kind {
+            ProviderKind::OpenAiCompatible => {
+                let api_key = self.read_credential(&profile)?;
+                let credential_access = credential_access(&profile);
+
+                Ok(ResolvedProvider {
+                    provider: Box::new(OpenAiCompatibleProvider::with_options(
+                        profile.name,
+                        profile.model,
+                        profile
+                            .base_url
+                            .unwrap_or_else(|| OPENAI_COMPATIBLE_BASE_URL.to_string()),
+                        api_key,
+                        profile.reasoning_split,
+                    )),
+                    credential_access: Some(credential_access),
+                })
+            }
+            ProviderKind::Rig => {
+                let family = RigProviderFamily::try_from_profile(&profile)?;
+                validate_rig_profile_options(&profile, family)?;
+
+                let api_key = self.read_credential(&profile)?;
+                let credential_access = credential_access(&profile);
+
+                Ok(ResolvedProvider {
+                    provider: Box::new(RigProvider::new(
+                        profile.name,
+                        family,
+                        profile.model,
+                        api_key,
+                        profile.base_url,
+                        profile.max_tokens,
+                    )),
+                    credential_access: Some(credential_access),
+                })
+            }
+        }
+    }
+
+    fn read_credential(
+        &self,
+        profile: &ResolvedProviderProfile,
+    ) -> Result<String, ProviderRegistryError> {
         let api_key = self.credentials.get(&profile.api_key_env).ok_or_else(|| {
             ProviderRegistryError::MissingCredential {
                 provider: profile.name.clone(),
@@ -189,28 +254,12 @@ impl ProviderRegistry {
 
         if api_key.trim().is_empty() {
             return Err(ProviderRegistryError::EmptyCredential {
-                provider: profile.name,
-                env_var: profile.api_key_env,
+                provider: profile.name.clone(),
+                env_var: profile.api_key_env.clone(),
             });
         }
 
-        let credential_access = CredentialAccess {
-            provider: profile.name.clone(),
-            env_var: profile.api_key_env.clone(),
-        };
-
-        match profile.kind {
-            ProviderKind::OpenAiCompatible => Ok(ResolvedProvider {
-                provider: Box::new(OpenAiCompatibleProvider::with_options(
-                    profile.name,
-                    profile.model,
-                    profile.base_url,
-                    api_key,
-                    profile.reasoning_split,
-                )),
-                credential_access: Some(credential_access),
-            }),
-        }
+        Ok(api_key)
     }
 }
 
@@ -228,9 +277,11 @@ impl ModelProvider for Box<dyn ModelProvider> {
 struct ResolvedProviderProfile {
     name: String,
     kind: ProviderKind,
+    family: Option<String>,
     model: String,
     api_key_env: String,
-    base_url: String,
+    base_url: Option<String>,
+    max_tokens: Option<u64>,
     reasoning_split: Option<bool>,
 }
 
@@ -239,15 +290,81 @@ impl From<&ProviderConfig> for ResolvedProviderProfile {
         Self {
             name: config.name.clone(),
             kind: config.kind,
+            family: config.family.clone(),
             model: config.model.clone(),
             api_key_env: config.api_key_env.clone(),
-            base_url: config
-                .base_url
-                .clone()
-                .unwrap_or_else(|| OPENAI_COMPATIBLE_BASE_URL.to_string()),
+            base_url: config.base_url.clone(),
+            max_tokens: config.max_tokens,
             reasoning_split: None,
         }
     }
+}
+
+fn credential_access(profile: &ResolvedProviderProfile) -> CredentialAccess {
+    CredentialAccess {
+        provider: profile.name.clone(),
+        env_var: profile.api_key_env.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigProviderFamily {
+    OpenAi,
+    Anthropic,
+}
+
+impl RigProviderFamily {
+    fn try_from_profile(profile: &ResolvedProviderProfile) -> Result<Self, ProviderRegistryError> {
+        let family = profile.family.as_deref().ok_or_else(|| {
+            ProviderRegistryError::InvalidProviderSpec {
+                provider: profile.name.clone(),
+                reason: "rig provider family is required",
+            }
+        })?;
+
+        match family {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            unsupported => Err(ProviderRegistryError::UnsupportedProviderFamily {
+                provider: profile.name.clone(),
+                family: unsupported.to_string(),
+            }),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    fn supports_base_url(self) -> bool {
+        matches!(self, Self::OpenAi)
+    }
+}
+
+fn validate_rig_profile_options(
+    profile: &ResolvedProviderProfile,
+    family: RigProviderFamily,
+) -> Result<(), ProviderRegistryError> {
+    if profile.base_url.is_some() && !family.supports_base_url() {
+        return Err(ProviderRegistryError::UnsupportedProviderOption {
+            provider: profile.name.clone(),
+            family: family.as_str().to_string(),
+            option: "base_url",
+        });
+    }
+
+    if profile.reasoning_split.is_some() {
+        return Err(ProviderRegistryError::UnsupportedProviderOption {
+            provider: profile.name.clone(),
+            family: family.as_str().to_string(),
+            option: "reasoning_split",
+        });
+    }
+
+    Ok(())
 }
 
 fn built_in_minimax_profile(
@@ -273,7 +390,9 @@ fn built_in_minimax_profile(
         kind: ProviderKind::OpenAiCompatible,
         model: model.to_string(),
         api_key_env: MINIMAX_API_KEY_ENV.to_string(),
-        base_url: minimax_base_url(),
+        base_url: Some(minimax_base_url()),
+        family: None,
+        max_tokens: None,
         reasoning_split: Some(true),
     }))
 }
@@ -314,6 +433,152 @@ impl ModelProvider for MockProvider {
         Ok(ModelResponse {
             final_message: self.final_message.clone(),
         })
+    }
+}
+
+pub struct RigProvider {
+    name: String,
+    family: RigProviderFamily,
+    model: String,
+    api_key: String,
+    base_url: Option<String>,
+    max_tokens: Option<u64>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl RigProvider {
+    pub fn new(
+        name: impl Into<String>,
+        family: RigProviderFamily,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        max_tokens: Option<u64>,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("provider async runtime configuration should be valid");
+
+        Self {
+            name: name.into(),
+            family,
+            model: model.into(),
+            api_key: api_key.into(),
+            base_url,
+            max_tokens,
+            runtime,
+        }
+    }
+
+    async fn complete_async(&self, task: String) -> Result<ModelResponse, ProviderError> {
+        match self.family {
+            RigProviderFamily::OpenAi => {
+                let mut builder =
+                    openai::CompletionsClient::builder().api_key(self.api_key.clone());
+                if let Some(base_url) = &self.base_url {
+                    builder = builder.base_url(base_url);
+                }
+
+                let client = builder.build().map_err(|_| {
+                    ProviderError::new(self.name.clone(), ProviderErrorKind::HttpTransport)
+                })?;
+                self.complete_rig_model(client.completion_model(self.model.clone()), task)
+                    .await
+            }
+            RigProviderFamily::Anthropic => {
+                let client = anthropic::Client::new(self.api_key.clone()).map_err(|_| {
+                    ProviderError::new(self.name.clone(), ProviderErrorKind::HttpTransport)
+                })?;
+                self.complete_rig_model(client.completion_model(self.model.clone()), task)
+                    .await
+            }
+        }
+    }
+
+    async fn complete_rig_model<M>(
+        &self,
+        model: M,
+        task: String,
+    ) -> Result<ModelResponse, ProviderError>
+    where
+        M: CompletionModel,
+    {
+        let response = model
+            .completion_request(task)
+            .max_tokens_opt(self.max_tokens)
+            .send()
+            .await
+            .map_err(|error| self.map_rig_error(error))?;
+
+        let final_message = final_message_from_rig_choice(response.choice).ok_or_else(|| {
+            ProviderError::new(
+                self.name.clone(),
+                ProviderErrorKind::MalformedResponse {
+                    reason: "missing text response",
+                },
+            )
+        })?;
+
+        Ok(ModelResponse { final_message })
+    }
+
+    fn map_rig_error(&self, error: CompletionError) -> ProviderError {
+        let kind = match error {
+            CompletionError::HttpError(_) => ProviderErrorKind::HttpTransport,
+            CompletionError::JsonError(_) | CompletionError::UrlError(_) => {
+                ProviderErrorKind::MalformedResponse {
+                    reason: "response JSON was invalid",
+                }
+            }
+            CompletionError::RequestError(_) => ProviderErrorKind::InvalidRequest,
+            CompletionError::ResponseError(_) => ProviderErrorKind::MalformedResponse {
+                reason: "provider response could not be converted",
+            },
+            CompletionError::ProviderError(_) => ProviderErrorKind::ProviderRejected,
+        };
+
+        ProviderError::new(self.name.clone(), kind)
+    }
+}
+
+impl fmt::Debug for RigProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RigProvider")
+            .field("name", &self.name)
+            .field("family", &self.family)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("max_tokens", &self.max_tokens)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModelProvider for RigProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.runtime.block_on(self.complete_async(request.task))
+    }
+}
+
+fn final_message_from_rig_choice(choice: rig::OneOrMany<AssistantContent>) -> Option<String> {
+    let mut message = String::new();
+
+    for content in choice {
+        if let AssistantContent::Text(text) = content {
+            message.push_str(&text.text);
+        }
+    }
+
+    if message.is_empty() {
+        None
+    } else {
+        Some(message)
     }
 }
 
@@ -492,8 +757,9 @@ mod tests {
     use crate::config::{ProviderConfig, ProviderKind};
 
     use super::{
-        MINIMAX_API_KEY_ENV, MockProvider, ModelProvider, ModelRequest, OpenAiCompatibleProvider,
-        ProviderErrorKind, ProviderRegistry, ProviderRegistryError,
+        CompletionError, MINIMAX_API_KEY_ENV, MockProvider, ModelProvider, ModelRequest,
+        OpenAiCompatibleProvider, ProviderErrorKind, ProviderRegistry, ProviderRegistryError,
+        RigProvider, RigProviderFamily,
     };
 
     #[test]
@@ -565,6 +831,39 @@ mod tests {
     }
 
     #[test]
+    fn registry_rejects_missing_and_empty_rig_credentials() {
+        let provider = rig_provider_config("rig-openai", "openai");
+        let missing = provider_registry_error(
+            ProviderRegistry::with_credentials(vec![provider.clone()], BTreeMap::new())
+                .resolve("rig-openai"),
+        );
+
+        assert_eq!(
+            missing,
+            ProviderRegistryError::MissingCredential {
+                provider: "rig-openai".to_string(),
+                env_var: "RIG_API_KEY".to_string(),
+            }
+        );
+
+        let empty = provider_registry_error(
+            ProviderRegistry::with_credentials(
+                vec![provider],
+                BTreeMap::from([("RIG_API_KEY".to_string(), " ".to_string())]),
+            )
+            .resolve("rig-openai"),
+        );
+
+        assert_eq!(
+            empty,
+            ProviderRegistryError::EmptyCredential {
+                provider: "rig-openai".to_string(),
+                env_var: "RIG_API_KEY".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn registry_resolves_minimax_opencode_style_model_id() {
         let resolved = ProviderRegistry::with_credentials(
             Vec::new(),
@@ -580,6 +879,72 @@ mod tests {
                 provider: "minimax/MiniMax-M2.7".to_string(),
                 env_var: MINIMAX_API_KEY_ENV.to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn registry_resolves_multiple_rig_provider_families() {
+        let resolved_openai = ProviderRegistry::with_credentials(
+            vec![rig_provider_config("rig-openai", "openai")],
+            BTreeMap::from([("RIG_API_KEY".to_string(), "test-token".to_string())]),
+        )
+        .resolve_with_audit("rig-openai")
+        .expect("rig openai provider should resolve");
+
+        assert_eq!(resolved_openai.provider.name(), "rig-openai");
+        assert_eq!(
+            resolved_openai.credential_access(),
+            Some(&super::CredentialAccess {
+                provider: "rig-openai".to_string(),
+                env_var: "RIG_API_KEY".to_string(),
+            })
+        );
+
+        let resolved_anthropic = ProviderRegistry::with_credentials(
+            vec![rig_provider_config("rig-anthropic", "anthropic")],
+            BTreeMap::from([("RIG_API_KEY".to_string(), "test-token".to_string())]),
+        )
+        .resolve_with_audit("rig-anthropic")
+        .expect("rig anthropic provider should resolve");
+
+        assert_eq!(resolved_anthropic.provider.name(), "rig-anthropic");
+    }
+
+    #[test]
+    fn registry_rejects_unsupported_rig_family_before_credentials() {
+        let error = provider_registry_error(
+            ProviderRegistry::with_credentials(
+                vec![rig_provider_config("future-provider", "future")],
+                BTreeMap::new(),
+            )
+            .resolve("future-provider"),
+        );
+
+        assert_eq!(
+            error,
+            ProviderRegistryError::UnsupportedProviderFamily {
+                provider: "future-provider".to_string(),
+                family: "future".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn registry_rejects_unsupported_rig_options_before_credentials() {
+        let mut provider = rig_provider_config("claude", "anthropic");
+        provider.base_url = Some("http://127.0.0.1:1/v1".to_string());
+
+        let error = provider_registry_error(
+            ProviderRegistry::with_credentials(vec![provider], BTreeMap::new()).resolve("claude"),
+        );
+
+        assert_eq!(
+            error,
+            ProviderRegistryError::UnsupportedProviderOption {
+                provider: "claude".to_string(),
+                family: "anthropic".to_string(),
+                option: "base_url",
+            }
         );
     }
 
@@ -673,13 +1038,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rig_provider_maps_request_and_response_through_openai_family() {
+        let server = FakeHttpServer::spawn(
+            200,
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"fake-model","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"rig provider completed"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"total_tokens":2}}"#,
+        );
+        let provider = RigProvider::new(
+            "rig-openai",
+            RigProviderFamily::OpenAi,
+            "fake-model",
+            "test-token",
+            Some(server.base_url().to_string()),
+            None,
+        );
+
+        let response = provider
+            .complete(ModelRequest {
+                task: "use rig".to_string(),
+            })
+            .expect("rig provider should complete");
+
+        assert_eq!(response.final_message, "rig provider completed");
+
+        let request = server.request();
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request_lower.contains("authorization: bearer test-token"));
+
+        let body = http_body(&request);
+        let value = serde_json::from_str::<Value>(body).expect("request body should be JSON");
+        assert_eq!(value["model"], "fake-model");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "use rig");
+    }
+
+    #[test]
+    fn rig_provider_returns_sanitized_errors() {
+        let server = FakeHttpServer::spawn(500, r#"{"error":"raw response body"}"#);
+        let provider = RigProvider::new(
+            "rig-openai",
+            RigProviderFamily::OpenAi,
+            "fake-model",
+            "secret-token",
+            Some(server.base_url().to_string()),
+            None,
+        );
+
+        let error = provider
+            .complete(ModelRequest {
+                task: "secret request body".to_string(),
+            })
+            .expect_err("provider error should fail");
+
+        assert_eq!(error.kind, ProviderErrorKind::HttpTransport);
+        let message = error.to_string();
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("secret request body"));
+        assert!(!message.contains("raw response body"));
+    }
+
+    #[test]
+    fn rig_error_mapping_is_sanitized_for_anthropic_family() {
+        let provider = RigProvider::new(
+            "rig-anthropic",
+            RigProviderFamily::Anthropic,
+            "claude-sonnet-4-5",
+            "secret-token",
+            None,
+            Some(2048),
+        );
+
+        let error = provider.map_rig_error(CompletionError::ProviderError(
+            "raw response body with secret-token and secret request body".to_string(),
+        ));
+
+        assert_eq!(error.kind, ProviderErrorKind::ProviderRejected);
+        let message = error.to_string();
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("secret request body"));
+        assert!(!message.contains("raw response body"));
+    }
+
     fn provider_config() -> ProviderConfig {
         ProviderConfig {
             name: "fake".to_string(),
             kind: ProviderKind::OpenAiCompatible,
+            family: None,
             model: "fake-model".to_string(),
             api_key_env: "FAKE_API_KEY".to_string(),
             base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            max_tokens: None,
+        }
+    }
+
+    fn rig_provider_config(name: &str, family: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            kind: ProviderKind::Rig,
+            family: Some(family.to_string()),
+            model: "fake-model".to_string(),
+            api_key_env: "RIG_API_KEY".to_string(),
+            base_url: None,
+            max_tokens: None,
         }
     }
 
