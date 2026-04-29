@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -12,6 +13,8 @@ pub struct LeanConfig {
     pub project: ProjectConfig,
     pub runtime: RuntimeConfig,
     pub events: EventConfig,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub commands: CommandConfig,
     #[serde(default)]
@@ -40,6 +43,25 @@ pub struct EventConfig {
     pub format: EventFormat,
     #[serde(default)]
     pub audit_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: ProviderKind,
+    pub model: String,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -139,6 +161,11 @@ impl LeanConfig {
             ));
         }
 
+        let mut provider_names = BTreeSet::new();
+        for provider in &self.providers {
+            validate_provider_config(provider, &mut provider_names)?;
+        }
+
         if self
             .workspace
             .worktree_root
@@ -179,6 +206,69 @@ impl LeanConfig {
     }
 }
 
+fn validate_provider_config(
+    provider: &ProviderConfig,
+    provider_names: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    if provider.name.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "providers.name must not be empty".to_string(),
+        ));
+    }
+
+    if provider.name == "mock" {
+        return Err(ConfigError::Validation(
+            "providers.name must not use reserved provider name mock".to_string(),
+        ));
+    }
+
+    if !provider_names.insert(provider.name.clone()) {
+        return Err(ConfigError::Validation(format!(
+            "providers.name must be unique: {}",
+            provider.name
+        )));
+    }
+
+    if provider.model.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "providers.model must not be empty".to_string(),
+        ));
+    }
+
+    if !is_valid_env_name(&provider.api_key_env) {
+        return Err(ConfigError::Validation(
+            "providers.api_key_env must be a valid environment variable name".to_string(),
+        ));
+    }
+
+    if let Some(base_url) = &provider.base_url {
+        let trimmed = base_url.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::Validation(
+                "providers.base_url must not be empty".to_string(),
+            ));
+        }
+
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+            return Err(ConfigError::Validation(
+                "providers.base_url must start with http:// or https://".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn default_max_turns() -> u32 {
     20
 }
@@ -207,6 +297,7 @@ mod tests {
         assert_eq!(config.runtime.max_turns, 12);
         assert_eq!(config.events.format, EventFormat::Jsonl);
         assert_eq!(config.events.audit_path, None);
+        assert!(config.providers.is_empty());
         assert_eq!(config.commands.allowed, Vec::<Vec<String>>::new());
         assert_eq!(config.commands.env_allowlist, vec!["PATH".to_string()]);
         assert_eq!(config.workspace.worktree_root, None);
@@ -393,6 +484,64 @@ commands:
         assert!(
             matches!(error, ConfigError::Validation(_)),
             "empty env allowlist entry should fail validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn parses_real_provider_config() {
+        let config = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: minimax
+events:
+  format: jsonl
+providers:
+  - name: minimax
+    type: openai-compatible
+    model: MiniMax-M2.7
+    api_key_env: MINIMAX_API_KEY
+    base_url: https://api.minimax.io/v1
+"#,
+        )
+        .expect("config with real provider should parse");
+
+        assert_eq!(config.providers.len(), 1);
+        let provider = &config.providers[0];
+        assert_eq!(provider.name, "minimax");
+        assert_eq!(provider.model, "MiniMax-M2.7");
+        assert_eq!(provider.api_key_env, "MINIMAX_API_KEY");
+        assert_eq!(
+            provider.base_url,
+            Some("https://api.minimax.io/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_provider_config() {
+        let error = LeanConfig::from_yaml_str(
+            r#"
+project:
+  name: lean
+  root: .
+runtime:
+  default_provider: bad
+events:
+  format: jsonl
+providers:
+  - name: bad
+    type: openai-compatible
+    model: ""
+    api_key_env: "not-valid"
+"#,
+        )
+        .expect_err("invalid provider config should fail validation");
+
+        assert!(
+            matches!(error, ConfigError::Validation(_)),
+            "invalid provider config should fail validation, got {error:?}"
         );
     }
 

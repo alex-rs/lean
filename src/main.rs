@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use lean::{
@@ -7,13 +7,14 @@ use lean::{
     cli::{Cli, Commands, RunArgs},
     config::{ConfigError, LeanConfig},
     doctor::run_doctor,
-    events::JsonlEvent,
-    provider::{MOCK_PROVIDER_NAME, MockProvider},
+    events::{CredentialAccessed, JsonlEvent},
+    provider::{CredentialAccess, ProviderRegistry},
     session::{SessionRun, SessionRunner},
 };
 use serde::Serialize;
 
 const DEFAULT_CONFIG_PATH: &str = "lean.yaml";
+const DEFAULT_CREDENTIAL_AUDIT_PATH: &str = "target/lean-audit.jsonl";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -31,12 +32,19 @@ fn run_command(cli: &Cli, args: &RunArgs) -> ExitCode {
         Err(message) => return exit_with_error(message),
     };
     let provider_name = resolve_provider_name(args, config.as_ref());
+    let resolved_provider =
+        match ProviderRegistry::from_config(config.as_ref()).resolve_with_audit(&provider_name) {
+            Ok(provider) => provider,
+            Err(error) => return exit_with_error(error.to_string()),
+        };
 
-    if provider_name != MOCK_PROVIDER_NAME {
-        return exit_with_error(format!("unsupported provider: {provider_name}"));
+    if let Some(access) = resolved_provider.credential_access() {
+        if let Err(error) = write_credential_audit(access, config.as_ref()) {
+            return exit_with_error(error);
+        }
     }
 
-    let mut runner = SessionRunner::new(MockProvider::default());
+    let mut runner = SessionRunner::new(resolved_provider.into_provider());
     let events = runner.run(SessionRun {
         task: args.task.clone(),
     });
@@ -59,6 +67,27 @@ fn run_command(cli: &Cli, args: &RunArgs) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn write_credential_audit(
+    access: &CredentialAccess,
+    config: Option<&LeanConfig>,
+) -> Result<(), String> {
+    let audit_path = credential_audit_path(config);
+    let event = JsonlEvent::CredentialAccessed(CredentialAccessed {
+        provider: access.provider.clone(),
+        env_var: access.env_var.clone(),
+    });
+
+    AuditWriter::new(audit_path)
+        .write_events(&[event])
+        .map_err(|error| error.to_string())
+}
+
+fn credential_audit_path(config: Option<&LeanConfig>) -> PathBuf {
+    config
+        .and_then(|config| config.events.audit_path.clone())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CREDENTIAL_AUDIT_PATH))
 }
 
 fn load_config_for_run(cli: &Cli, args: &RunArgs) -> Result<Option<LeanConfig>, String> {
